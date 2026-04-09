@@ -510,7 +510,7 @@ bool Adafruit_AS7331::getReadyPinOpenDrain(void) {
 
 /**
  * @brief Set the break time for SYNS/SYND modes
- * @param breakTime Break time register value
+ * @param breakTime Break time register value, 0-255 (x 8us)
  * @return true if the operation succeeded, false otherwise
  */
 bool Adafruit_AS7331::setBreakTime(uint8_t breakTime) {
@@ -520,7 +520,7 @@ bool Adafruit_AS7331::setBreakTime(uint8_t breakTime) {
 
 /**
  * @brief Read the break time register
- * @return Break time register value
+ * @return Break time register value (x8 for microseconds)
  */
 uint8_t Adafruit_AS7331::getBreakTime(void) {
   Adafruit_BusIO_Register brk(_i2c_dev, AS7331_REG_BREAK);
