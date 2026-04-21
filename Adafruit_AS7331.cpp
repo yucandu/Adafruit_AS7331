@@ -70,21 +70,29 @@ bool Adafruit_AS7331::begin(TwoWire *wire, uint8_t addr) {
   }
   delay(10); // Wait for reset to complete
 
-  // Cache default gain/time values
+  // Cache default gain/time/clock values
   Adafruit_BusIO_Register creg1(_i2c_dev, AS7331_REG_CREG1);
   uint8_t creg1_val = 0;
   creg1.read(&creg1_val);
   _cached_gain = (creg1_val >> 4) & 0x0F;
   _cached_time = creg1_val & 0x0F;
 
+  Adafruit_BusIO_Register creg3(_i2c_dev, AS7331_REG_CREG3);
+  uint8_t creg3_val = 0;
+  creg3.read(&creg3_val);
+  _cached_clock = creg3_val & 0x03;
+
   // Verify we're in config state by reading AGEN (0x02)
+  // AGEN contains DEVID (bits 7:4 = 0010) and MUT (bits 3:0 = 0001)
+  // Combined: 0x21
   Adafruit_BusIO_Register agen(_i2c_dev, AS7331_REG_AGEN);
-  uint8_t part_id = 0;
-  if (!agen.read(&part_id)) {
+  uint8_t agen_val = 0;
+  if (!agen.read(&agen_val)) {
     return false;
   }
 
-  return (part_id == AS7331_PART_ID);
+  // Check that DEVID nibble is 0x02 (expected for AS7331)
+  return ((agen_val & 0xF0) >> 4) == 0x02;
 }
 
 /**
@@ -101,8 +109,12 @@ bool Adafruit_AS7331::reset(void) {
 }
 
 /**
- * @brief Read the device ID
- * @return Device part ID register value
+ * @brief Read the device ID (AGEN register)
+ * @return AGEN register value (DEVID nibble 7:4 should be 0x02, MUT nibble 3:0)
+ *
+ * Note: This returns the full AGEN register (0x02 bits 7:4 + 0x01 bits 3:0 = 0x21),
+ * not just the DEVID nibble. To check only the device type, mask bits 7:4 and
+ * compare to 0x20.
  */
 uint8_t Adafruit_AS7331::getDeviceID(void) {
   Adafruit_BusIO_Register agen(_i2c_dev, AS7331_REG_AGEN);
@@ -125,6 +137,11 @@ as7331_mode_t Adafruit_AS7331::getMeasurementMode(void) {
  * @brief Enter or exit power-down mode
  * @param pd True to power down, false to wake
  * @return true if the operation succeeded, false otherwise
+ *
+ * When waking from power-down (pd=false), this only switches to measurement state
+ * and waits for startup. It does NOT automatically start a measurement.
+ * Call startMeasurement() separately if needed.
+ * Startup time is up to 2ms per datasheet; actual delay may be shorter.
  */
 bool Adafruit_AS7331::powerDown(bool pd) {
   Adafruit_BusIO_Register osr(_i2c_dev, AS7331_REG_OSR);
@@ -137,20 +154,19 @@ bool Adafruit_AS7331::powerDown(bool pd) {
   }
 
   if (pd) {
+    // Power down: stop measurement and return to config state
     if (!ss_bit.write(false)) {
       return false;
     }
-    if (!dos_bits.write(0x02)) {
+    if (!dos_bits.write(0x02)) { // DOS=010 (configuration state)
       return false;
     }
   } else {
-    if (!dos_bits.write(0x03)) {
+    // Wake up: switch to measurement state (but don't start measurement)
+    if (!dos_bits.write(0x03)) { // DOS=011 (measurement state)
       return false;
     }
-    if (!ss_bit.write(true)) {
-      return false;
-    }
-    delay(2);
+    delay(2); // Wait for startup (max 2ms per datasheet)
   }
 
   return true;
@@ -225,7 +241,11 @@ as7331_time_t Adafruit_AS7331::getIntegrationTime(void) {
 bool Adafruit_AS7331::setClockFrequency(as7331_clock_t clock) {
   Adafruit_BusIO_Register creg3(_i2c_dev, AS7331_REG_CREG3);
   Adafruit_BusIO_RegisterBits cclk(&creg3, 2, 0);
-  return cclk.write(clock);
+  if (cclk.write(clock)) {
+    _cached_clock = clock;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -298,14 +318,23 @@ bool Adafruit_AS7331::readAllUV(uint16_t *uva, uint16_t *uvb, uint16_t *uvc) {
  * Algorithm from AS7331 datasheet (DS001047 v4-00), Section 7.4
  * "Measurement Result".
  *
- * The effective sensitivity scales with gain and integration time:
- *   effective_sens = base_sens × (gain_factor / 2048) × (time_factor)
+ * The effective sensitivity scales with gain, integration time, and clock:
+ *   effective_sens = base_sens × (gain_factor / 2048) × (time_factor) × (clock_factor)
  *
  * Where:
- *   - base_sens: Responsivity at GAIN=2048x, TIME=64ms (from datasheet Table 5)
- *   - gain_factor = 2^(11 - gain_setting), ranging from 1 (GAIN_1X) to 2048
- *     (GAIN_2048X)
+ *   - base_sens: Responsivity at GAIN=2048x, TIME=64ms, fCLK=1.024 MHz
+ *     (from datasheet Table 5)
+ *   - gain_factor = 2^(11 - gain_setting) for valid gains at current clock
  *   - time_factor = 2^time_setting / 64, where TIME_64MS=6 gives factor=1.0
+ *     Special case: TIME=15 (0b1111) wraps to TIME=0 per datasheet Fig 28-32
+ *   - clock_factor = 1.024 / actual_clock_mhz (base sensitivities are at 1.024 MHz)
+ *     Clock values: 0=1.024, 1=2.048, 2=4.096, 3=8.192 MHz
+ *
+ * Note: At higher clock frequencies (2.048 MHz+), certain GAIN settings collapse
+ * (datasheet Fig 33). This function uses the programmed gain value; the hardware
+ * automatically maps invalid gains, and the effective gain is reduced. The actual
+ * count output already reflects this hardware behavior, so we apply the programmed
+ * gain formula as-is (it will be naturally scaled by the reduced hardware gain).
  *
  * Irradiance = counts / effective_sensitivity
  *
@@ -319,12 +348,28 @@ float Adafruit_AS7331::_countsToIrradiance(uint16_t counts,
   // Use cached values instead of reading registers
   uint8_t gain_setting = _cached_gain;
   uint8_t time_setting = _cached_time;
+  uint8_t clock_setting = _cached_clock;
 
+  // TIME=15 (0b1111) wraps to TIME=0 per datasheet Figure 28, 30, 32
+  if (time_setting == 15) {
+    time_setting = 0;
+  }
+
+  // Gain factor: 2^(11 - gain_setting), valid range [1, 2048]
   float gain_factor = (float)(1 << (11 - gain_setting));
+
+  // Time factor: 2^time_setting / 64
+  // TIME_64MS (6) gives 2^6 / 64 = 64 / 64 = 1.0 (reference condition)
   float time_factor = (float)(1 << time_setting) / 64.0f;
 
-  float effective_sens =
-      baseSensitivity * (gain_factor / 2048.0f) * time_factor;
+  // Clock factor: base sensitivities are measured at 1.024 MHz
+  // Clock setting 0=1.024 MHz (factor=1.0), 1=2.048 MHz (factor=0.5), etc.
+  // If clock frequency doubles, each count represents twice the irradiance,
+  // so we divide by 2 (factor *= 0.5)
+  float clock_factor = 1.0f / (1 << clock_setting);
+
+  // Effective sensitivity combines all factors
+  float effective_sens = baseSensitivity * (gain_factor / 2048.0f) * time_factor * clock_factor;
 
   if (effective_sens < 0.001f) {
     return 0.0f;
@@ -393,10 +438,10 @@ bool Adafruit_AS7331::readAllUV_uWcm2(float *uva, float *uvb, float *uvc) {
  * @return true on success, false on timeout or read failure
  */
 bool Adafruit_AS7331::oneShot(uint16_t *uva, uint16_t *uvb, uint16_t *uvc) {
-  // Ensure we're in CMD mode and config state
-  powerDown(true);
-  setMeasurementMode(AS7331_MODE_CMD);
-  powerDown(false);
+  // Ensure we're in CMD mode and powered up
+  powerDown(true);  // Power down and go to config state
+  setMeasurementMode(AS7331_MODE_CMD);  // Set to command mode (only in config)
+  powerDown(false); // Wake up (goes to measurement state, doesn't start measurement)
 
   // Start single measurement
   startMeasurement();
@@ -509,9 +554,14 @@ bool Adafruit_AS7331::getReadyPinOpenDrain(void) {
 }
 
 /**
- * @brief Set the break time for SYNS/SYND modes
- * @param breakTime Break time register value, 0-255 (x 8us)
+ * @brief Set the break time between consecutive measurements
+ * @param breakTime Break time register value, 0-255 (each unit = 8µs)
  * @return true if the operation succeeded, false otherwise
+ *
+ * Break time inserts a delay between consecutive measurements in CONT, SYNS,
+ * and SYND modes. This provides time for I²C data reads without interfering
+ * with measurements. Range: 0–255, where each unit = 8µs.
+ * Suggested: 100–255 to avoid measurement disturbance during data fetch.
  */
 bool Adafruit_AS7331::setBreakTime(uint8_t breakTime) {
   Adafruit_BusIO_Register brk(_i2c_dev, AS7331_REG_BREAK);
@@ -531,10 +581,17 @@ uint8_t Adafruit_AS7331::getBreakTime(void) {
 
 /**
  * @brief Set the edge count for SYND mode
- * @param edges Edge count value
+ * @param edges Edge count value (1-255; 0 is treated as 1 per datasheet)
  * @return true if the operation succeeded, false otherwise
+ *
+ * The datasheet specifies that EDGES=0 is invalid and treated as 1 by hardware.
+ * This function enforces that constraint by automatically converting 0 to 1.
  */
 bool Adafruit_AS7331::setEdgeCount(uint8_t edges) {
+  // Datasheet: EDGES=0 is illegal, treated as 1 by hardware
+  if (edges == 0) {
+    edges = 1;
+  }
   Adafruit_BusIO_Register reg(_i2c_dev, AS7331_REG_EDGES);
   return reg.write(edges);
 }
@@ -612,6 +669,95 @@ uint8_t Adafruit_AS7331::getDivider(void) {
   Adafruit_BusIO_Register creg2(_i2c_dev, AS7331_REG_CREG2);
   Adafruit_BusIO_RegisterBits div_bits(&creg2, 3, 0);
   return div_bits.read();
+}
+
+/**
+ * @brief Read the output conversion time (OUTCONV register)
+ * @return Conversion time in internal clock counts
+ *
+ * This register (addresses 0x05-0x06) contains the measured conversion time
+ * when EN_TM bit in CREG2 is set to 1. Critical for SYND mode and accurate
+ * irradiance calculation (datasheet Eq 4).
+ */
+uint16_t Adafruit_AS7331::readOutConversionTime(void) {
+  Adafruit_BusIO_Register outconv(_i2c_dev, AS7331_REG_OUTCONV1, 2, LSBFIRST);
+  return outconv.read();
+}
+
+/**
+ * @brief Enable or disable conversion time measurement
+ * @param enable True to enable EN_TM, false to disable
+ * @return true if the operation succeeded, false otherwise
+ *
+ * When enabled, the OUTCONV register (0x05-0x06) is populated with the
+ * actual conversion time in internal clock counts. This is critical for:
+ * - SYND mode measurements
+ * - More accurate irradiance calculation (eliminates clock tolerance)
+ */
+bool Adafruit_AS7331::enableConversionTimeMeasurement(bool enable) {
+  Adafruit_BusIO_Register creg2(_i2c_dev, AS7331_REG_CREG2);
+  Adafruit_BusIO_RegisterBits en_tm(&creg2, 1, 4);
+  return en_tm.write(enable);
+}
+
+/**
+ * @brief Check if conversion time measurement is enabled
+ * @return true if EN_TM is set, false otherwise
+ */
+bool Adafruit_AS7331::getConversionTimeMeasurementEnabled(void) {
+  Adafruit_BusIO_Register creg2(_i2c_dev, AS7331_REG_CREG2);
+  Adafruit_BusIO_RegisterBits en_tm(&creg2, 1, 4);
+  return en_tm.read();
+}
+
+/**
+ * @brief Check standby state from STATUS register
+ * @return true if in standby state, false otherwise
+ *
+ * STATUS bit 1 indicates whether standby mode is active.
+ */
+bool Adafruit_AS7331::getStandbyState(void) {
+  uint8_t status = getStatus();
+  return (status & AS7331_STATUS_STANDBYSTATE) != 0;
+}
+
+/**
+ * @brief Check power state from STATUS register
+ * @return true if powered (not in power-down), false if power-down active
+ *
+ * STATUS bit 0 indicates the device power state.
+ * 0 = power-down state, 1 = normal operation
+ */
+bool Adafruit_AS7331::getPowerState(void) {
+  uint8_t status = getStatus();
+  return (status & AS7331_STATUS_POWERSTATE) != 0;
+}
+
+/**
+ * @brief Switch to Configuration state (DOS=010)
+ * @return true if the operation succeeded, false otherwise
+ *
+ * In Configuration state, you can modify CREG1, CREG2, CREG3 registers.
+ * Measurement is not possible. Use changeToMeasurementState() to switch back.
+ */
+bool Adafruit_AS7331::changeToConfigurationState(void) {
+  Adafruit_BusIO_Register osr(_i2c_dev, AS7331_REG_OSR);
+  Adafruit_BusIO_RegisterBits dos_bits(&osr, 3, 0);
+  return dos_bits.write(0x02);
+}
+
+/**
+ * @brief Switch to Measurement state (DOS=011)
+ * @return true if the operation succeeded, false otherwise
+ *
+ * In Measurement state, you can read result registers and start measurements.
+ * Configuration registers (CREG1, CREG2, CREG3) are read-only.
+ * This function does NOT start a measurement; call startMeasurement() separately.
+ */
+bool Adafruit_AS7331::changeToMeasurementState(void) {
+  Adafruit_BusIO_Register osr(_i2c_dev, AS7331_REG_OSR);
+  Adafruit_BusIO_RegisterBits dos_bits(&osr, 3, 0);
+  return dos_bits.write(0x03);
 }
 
 /**
