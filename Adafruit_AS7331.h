@@ -33,6 +33,9 @@
 #define AS7331_REG_CREG3 0x08 ///< Configuration register 3
 #define AS7331_REG_BREAK 0x09 ///< Break time register
 #define AS7331_REG_EDGES 0x0A ///< Edge count register
+#define AS7331_REG_OUTCONV1 0x05 ///< Output conversion low byte register
+#define AS7331_REG_OUTCONV2 0x06 ///< Output conversion high byte register
+#define AS7331_REG_OPTREG 0x0B ///< Option register
 
 #define AS7331_STATUS_OUTCONVOF (1 << 7) ///< Output conversion overflow
 #define AS7331_STATUS_MRESOF (1 << 6)    ///< Measurement result overflow
@@ -40,6 +43,8 @@
 #define AS7331_STATUS_LDATA (1 << 4)     ///< Data in OUTCONV registers
 #define AS7331_STATUS_NDATA (1 << 3)     ///< New data available
 #define AS7331_STATUS_NOTREADY (1 << 2)  ///< Not ready (conversion in progress)
+#define AS7331_STATUS_STANDBYSTATE (1 << 1) ///< Standby state active
+#define AS7331_STATUS_POWERSTATE (1 << 0)   ///< Power state (0=power down, 1=normal)
 
 #define AS7331_PART_ID 0x21 ///< AS7331 part ID
 
@@ -88,10 +93,10 @@ typedef enum {
 
 /** Clock frequency settings for the AS7331 */
 typedef enum {
-  AS7331_CLOCK_1024MHZ = 0, ///< 1.024 MHz clock
-  AS7331_CLOCK_2048MHZ = 1, ///< 2.048 MHz clock
-  AS7331_CLOCK_4096MHZ = 2, ///< 4.096 MHz clock
-  AS7331_CLOCK_8192MHZ = 3, ///< 8.192 MHz clock
+  AS7331_CLOCK_1024KHZ = 0, ///< 1.024 MHz clock (note: MHz, not KHz in the value)
+  AS7331_CLOCK_2048KHZ = 1, ///< 2.048 MHz clock
+  AS7331_CLOCK_4096KHZ = 2, ///< 4.096 MHz clock
+  AS7331_CLOCK_8192KHZ = 3, ///< 8.192 MHz clock
 } as7331_clock_t;
 
 /**
@@ -152,6 +157,16 @@ public:
   bool stopMeasurement(void);  // Set SS=0
   bool hasLostData(void);      // STATUS:LDATA flag
 
+  uint16_t readOutConversionTime(void); // Read OUTCONV register (conversion time in clocks)
+  bool enableConversionTimeMeasurement(bool enable); // Enable EN_TM in CREG2
+  bool getConversionTimeMeasurementEnabled(void);
+
+  bool getStandbyState(void);  // STATUS:STANDBYSTATE bit
+  bool getPowerState(void);    // STATUS:POWERSTATE bit
+
+  bool changeToConfigurationState(void); // Switch DOS to 010 (config)
+  bool changeToMeasurementState(void);   // Switch DOS to 011 (measurement)
+
   bool enableDivider(bool enable);
   bool setDivider(uint8_t div); // 0-7, factor = 2^(1+div)
   uint8_t getDivider(void);
@@ -165,4 +180,5 @@ private:
   Adafruit_I2CDevice *_i2c_dev = nullptr; ///< Pointer to I2C device
   uint8_t _cached_gain = 10;              ///< Cached gain setting
   uint8_t _cached_time = 6;               ///< Cached integration time setting
+  uint8_t _cached_clock = 0;              ///< Cached clock frequency setting
 };
